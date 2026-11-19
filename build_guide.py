@@ -386,8 +386,7 @@ for e in entries:
     line = line.replace('group-title="Undefined"', 'group-title="General"')
     gm = re.search(r'group-title="([^"]+)"', line)
     primary = gm.group(1).split(";")[0].strip() if gm else "General"
-    line = re.sub(r'group-title="([^"]+)"',
-                  lambda m: 'group-title="' + m.group(1).replace(";", "-") + '"', line)
+    line = re.sub(r'group-title="[^"]+"', f'group-title="{primary}"', line)
     picked.append((PRIORITY.get(primary, 25), e["name"].lower(), line, e["url"]))
 for be in buddy_entries:
     line = f'#EXTINF:-1 tvg-id="{be["gid"]}"'
