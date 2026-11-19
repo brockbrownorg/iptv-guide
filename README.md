@@ -29,7 +29,13 @@ own IDs, so Opus matches them directly.
    their stream URL, the rest by unique normalized name matches only.
 4. Writes `public/guide.xml.gz` (programmes from today UTC forward) and
    `public/us-playlist.m3u` (only the matched channels, IDs rewritten to match the guide).
+5. Adds the BuddyChewChew app-m3u-generator service playlists (Pluto TV US,
+   Samsung TV Plus US, Plex US, Roku, Xumo, Tubi). Those are generated from the
+   services themselves and their channel IDs match their guide files by design
+   (the i.mjh.nz US guides for Pluto, Samsung, Plex and Roku, and the
+   generators' own EPG for Xumo and Tubi), so every kept channel has real
+   programme data. Service IDs are prefixed per service to avoid collisions,
+   and channels are deduplicated by name against the iptv-org matches.
 
-The 2026-11-18 build covered 447 of 1,346 unique US channels (about 33 percent,
-23,525 programmes over the next few days). The rest are mostly small local and niche
-streams that no free guide publishes data for.
+The 2026-11-18 build covers 1,605 channels and 1,627 streams (166 in the
+Movies category), with 73,101 programmes over the next few days.
