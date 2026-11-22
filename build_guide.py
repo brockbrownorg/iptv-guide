@@ -230,8 +230,14 @@ buddy_entries = []          # dicts: gid, name, logo, category, url
 buddy_epg = {}              # service -> (filename, {orig_id: gid})
 for service, pl_url, epg_fname, epg_url in BUDDY:
     pl_path = os.path.join(WORK, f"buddy_{service}.m3u")
-    fetch(pl_url, pl_path)
-    fetch(epg_url, os.path.join(WORK, epg_fname))
+    try:
+        fetch(pl_url, pl_path)
+        fetch(epg_url, os.path.join(WORK, epg_fname))
+    except Exception as e:
+        # An upstream service playlist can vanish (Tubi's did, Nov 2026);
+        # skip that service instead of failing the whole build.
+        print(f"SKIP {service}: source unavailable ({e})", flush=True)
+        continue
     # which EPG channel ids actually have programmes from today forward?
     opener = gzip.open if epg_fname.endswith(".gz") else open
     have_prog = set()
