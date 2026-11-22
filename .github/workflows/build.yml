@@ -1,23 +1,18 @@
 name: Build IPTV guide
 
-
 on:
   schedule:
-    - cron: "15 9 * * *"→ Runs at 09:15
-
+    - cron: "15 9 * * *"
   workflow_dispatch:
-
 
 permissions:
   contents: read
   pages: write
   id-token: write
 
-
 concurrency:
   group: pages
   cancel-in-progress: false
-
 
 jobs:
   build:
@@ -33,4 +28,3 @@ jobs:
         with:
           path: public
       - uses: actions/deploy-pages@v4
-
