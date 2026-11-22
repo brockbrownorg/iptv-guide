@@ -24,7 +24,7 @@ jobs:
           python-version: "3.12"
       - name: Build guide
         run: python3 build_guide.py
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v4
         with:
           path: public
-      - uses: actions/deploy-pages@v4
+      - uses: actions/deploy-pages@v5
