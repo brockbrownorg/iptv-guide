@@ -16,13 +16,19 @@ Two reputable, self-updating source families, both free and legal:
    real programme data. IDs are prefixed per service to avoid collisions.
 
 Output (in public/):
-  us-playlist.m3u  - only channels that have guide data, IDs rewritten to
-                     match the guide, ordered Movies first, then Series,
-                     Entertainment, Comedy, News, Sports, and so on.
+  us-playlist.m3u  - channels with guide data (IDs rewritten to match the
+                     guide) plus playlist-only channels from the extra
+                     sources in section 3b (iptv-org remainder, Free-TV
+                     USA, APSatTV bundles; no guide data for those),
+                     ordered Movies first, then Series, Entertainment,
+                     Comedy, News, Sports, and so on.
   guide.xml.gz     - XMLTV programmes from today (UTC) forward.
+  vod-library.m3u  - separate on-demand movie library (PublicDomainM3U:
+                     public-domain films and episodes from Archive.org,
+                     genre group-titles kept as shelves).
   index.html       - small landing page with the links and counts.
 """
-import gzip, os, re, unicodedata, urllib.request
+import gzip, io, os, re, unicodedata, urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
@@ -55,6 +61,8 @@ BUDDY = [
      "buddy_xumo.xml.gz",    "https://raw.githubusercontent.com/BuddyChewChew/xumo-playlist-generator/main/playlists/xumo_epg.xml.gz"),
     ("tubi",    "https://raw.githubusercontent.com/BuddyChewChew/app-m3u-generator/main/playlists/tubi_all.m3u",
      "buddy_tubi.xml",       "https://raw.githubusercontent.com/BuddyChewChew/app-m3u-generator/main/playlists/tubi_epg.xml"),
+    ("lg",      "https://raw.githubusercontent.com/BuddyChewChew/lg-playlist-generator/refs/heads/main/lg_channels_us.m3u",
+     "buddy_lg.xml",         "https://raw.githubusercontent.com/BuddyChewChew/lg-playlist-generator/main/lg_channels_us.xml"),
 ]
 
 GROUP_MAP = {
@@ -107,6 +115,19 @@ def fetch(url, dest):
                 break
             f.write(chunk)
     print(f"  -> {dest} ({os.path.getsize(dest)} bytes)", flush=True)
+
+
+def epg_stream(path):
+    """Buddy EPG files as a parseable stream. The LG generator's EPG
+    ships bare '&' characters in some titles (invalid XML that
+    ElementTree rejects outright), so escape any ampersand that does
+    not start a valid entity before parsing. Valid files are
+    unaffected: a literal '&' in well-formed XML is always escaped."""
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rb") as f:
+        data = f.read()
+    data = re.sub(rb"&(?!amp;|lt;|gt;|quot;|apos;|#)", b"&amp;", data)
+    return io.BytesIO(data)
 
 
 def norm(s):
@@ -239,10 +260,9 @@ for service, pl_url, epg_fname, epg_url in BUDDY:
         print(f"SKIP {service}: source unavailable ({e})", flush=True)
         continue
     # which EPG channel ids actually have programmes from today forward?
-    opener = gzip.open if epg_fname.endswith(".gz") else open
     have_prog = set()
     chan_names = {}
-    with opener(os.path.join(WORK, epg_fname), "rb") as f:
+    with epg_stream(os.path.join(WORK, epg_fname)) as f:
         for ev, el in ET.iterparse(f, events=("end",)):
             if el.tag == "channel":
                 cid = el.get("id")
@@ -301,6 +321,174 @@ for service, pl_url, epg_fname, epg_url in BUDDY:
     print(f"buddy {service}: kept {kept} channels with guide data", flush=True)
 print(f"buddy total: {len(buddy_entries)}")
 
+# ---------- 3b. extra playlist-only sources (no EPG requirement) ----------
+# Added Nov 24, 2026 from the expansion research. These sources add
+# channels that carry no guide data in this build, deduped by normalized
+# name against everything already kept (existing services win). Every
+# fetch is failure-tolerant: a dead source is skipped, never fatal.
+def fetch_text(url, timeout=60):
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (guide-builder)"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"fetch failed {url}: {e}", flush=True)
+        return None
+
+def parse_m3u(text):
+    pairs = []
+    ls = text.splitlines()
+    for i, line in enumerate(ls):
+        if line.startswith("#EXTINF") and i + 1 < len(ls):
+            pairs.append((line, ls[i + 1].strip()))
+    return pairs
+
+def sanitize_id(s):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", s).strip("-") or "x"
+
+ADULT_HINTS = ("xxx", "adult", "porn")
+def is_adult(group):
+    g = (group or "").lower()
+    return any(h in g for h in ADULT_HINTS)
+
+def primary_group(line):
+    gm = re.search(r'group-title="([^"]+)"', line)
+    if not gm:
+        return "General"
+    g = gm.group(1).split(";")[0].strip()
+    return "General" if g in ("", "Undefined") else g
+
+extra_entries = []   # same shape as buddy_entries
+extra_stats = {}     # label -> (fetched, added)
+extra_ids = set()
+def add_extra(gid, name, logo, category, url):
+    if gid in extra_ids:
+        return False
+    extra_ids.add(gid)
+    extra_entries.append({"gid": gid, "name": name, "logo": logo,
+                          "category": category, "url": url})
+    return True
+
+# iptv-org remainder: every US entry not already in the build via the
+# guide match (section 2) or a Buddy service (section 3). The us.m3u
+# header is a bare "#EXTM3U" (checked Nov 24, 2026): it declares no
+# url-tvg / x-tvg-url guide, so these channels are added with no EPG
+# rather than inventing a guide URL. If a future header does declare
+# guide URLs, they are downloaded below and any iptv-org channels whose
+# ids appear there with programmes are merged into the guide in
+# section 4 (guarded, size-capped, failure-tolerant).
+first_line = lines[0] if lines else ""
+declared_guides = re.findall(r'(?:x-tvg-url|url-tvg)="([^"]+)"', first_line)
+iptvorg_epg_map = {}   # gid -> (work filename, guide channel id)
+iptvorg_srcid = {}     # gid -> original iptv-org tvg-id
+new_cores = set()
+n_add = 0
+for e in entries:
+    if e["base"] in matches:
+        continue
+    ck = core(e["name"])
+    if not ck or ck in seen_names:
+        continue
+    group = primary_group(e["line"])
+    if is_adult(group):
+        continue
+    gid = "iptvorg-" + sanitize_id(e["full"])
+    lm = re.search(r'tvg-logo="([^"]+)"', e["line"])
+    if add_extra(gid, e["name"], lm.group(1) if lm else "", group, e["url"]):
+        iptvorg_srcid[gid] = e["full"]
+        new_cores.add(ck)
+        n_add += 1
+seen_names |= new_cores
+extra_stats["iptv-org remainder"] = (len(entries), n_add)
+print(f"extra iptv-org remainder: fetched {len(entries)}, added {n_add} after dedupe", flush=True)
+
+if declared_guides:
+    print(f"iptv-org header declares guide(s): {declared_guides}", flush=True)
+    for gi, gurl in enumerate(declared_guides):
+        gname = f"iptvorg_epg_{gi}.xml" + (".gz" if gurl.endswith(".gz") else "")
+        try:
+            fetch(gurl, os.path.join(WORK, gname))
+            if os.path.getsize(os.path.join(WORK, gname)) > 60_000_000:
+                print("iptv-org declared guide too large, skipping merge", flush=True)
+                continue
+        except Exception as e:
+            print(f"iptv-org declared guide unavailable ({e})", flush=True)
+            continue
+        gopener = gzip.open if gname.endswith(".gz") else open
+        have = set()
+        with gopener(os.path.join(WORK, gname), "rb") as f:
+            for ev, el in ET.iterparse(f, events=("end",)):
+                if el.tag == "programme" and el.get("start", "")[:14] >= TODAY:
+                    have.add(el.get("channel"))
+                el.clear()
+        for ex in extra_entries:
+            if ex["gid"] in iptvorg_srcid:
+                full = iptvorg_srcid[ex["gid"]]
+                for cand in (full, full.split("@")[0]):
+                    if cand in have:
+                        iptvorg_epg_map[ex["gid"]] = (gname, cand)
+                        break
+    print(f"iptv-org declared-guide matches: {len(iptvorg_epg_map)}", flush=True)
+else:
+    print("iptv-org header declares no guide; remainder added with no EPG", flush=True)
+
+# Free-TV USA: hand-curated OTA/subchannel list. Its own x-tvg-url header
+# (100+ epgshare01 files) is ignored on purpose.
+ft_text = fetch_text("https://raw.githubusercontent.com/Free-TV/IPTV/master/playlists/playlist_usa.m3u8")
+ft_fetch = ft_add = 0
+if ft_text:
+    ft_pairs = parse_m3u(ft_text)
+    ft_fetch = len(ft_pairs)
+    for line, url in ft_pairs:
+        name = line.rsplit(",", 1)[-1].strip()
+        ck = core(name)
+        if not ck or ck in seen_names:
+            continue
+        group = primary_group(line)
+        if is_adult(group):
+            continue
+        m = re.search(r'tvg-id="([^"]+)"', line)
+        gid = "freetv-" + sanitize_id(m.group(1) if m else name)
+        lm = re.search(r'tvg-logo="([^"]+)"', line)
+        if add_extra(gid, name, lm.group(1) if lm else "", group, url):
+            seen_names.add(ck)
+            ft_add += 1
+extra_stats["Free-TV USA"] = (ft_fetch, ft_add)
+print(f"extra Free-TV USA: fetched {ft_fetch}, added {ft_add} after dedupe", flush=True)
+
+# APSatTV device bundles: gated. A list is included only if it downloads
+# and parses to at least one entry; any failure skips it silently.
+APSAT = [("vizio",    "https://www.apsattv.com/vizio.m3u"),
+         ("tcl",      "https://www.apsattv.com/tcl.m3u"),
+         ("tablo",    "https://www.apsattv.com/tablo.m3u"),
+         ("firetv",   "https://www.apsattv.com/firetv.m3u"),
+         ("localnow", "https://www.apsattv.com/localnow.m3u"),
+         ("cineverse", "https://www.apsattv.com/cineverse.m3u"),
+         ("vidaa",    "https://www.apsattv.com/vidaa.m3u")]
+for slug, aurl in APSAT:
+    a_fetch = a_add = 0
+    atext = fetch_text(aurl, timeout=30)
+    if atext:
+        a_pairs = parse_m3u(atext)
+        a_fetch = len(a_pairs)
+        for line, url in a_pairs:
+            name = line.rsplit(",", 1)[-1].strip()
+            ck = core(name)
+            if not ck or ck in seen_names:
+                continue
+            group = primary_group(line)
+            if is_adult(group):
+                continue
+            m = re.search(r'tvg-id="([^"]+)"', line)
+            gid = f"apsat-{slug}-" + sanitize_id(m.group(1) if m else name)
+            lm = re.search(r'tvg-logo="([^"]+)"', line)
+            if add_extra(gid, name, lm.group(1) if lm else "", group, url):
+                seen_names.add(ck)
+                a_add += 1
+    extra_stats[f"APSatTV {slug}"] = (a_fetch, a_add)
+    print(f"extra APSatTV {slug}: fetched {a_fetch}, added {a_add} after dedupe", flush=True)
+print(f"extra total: {len(extra_entries)}")
+
 # ---------- 4. write the guide ----------
 names = {}
 for e in entries:
@@ -347,6 +535,12 @@ for be in buddy_entries:
     if be["logo"]:
         out.write(f"    <icon src={quoteattr(be['logo'])}/>\n")
     out.write("  </channel>\n")
+for ex in extra_entries:
+    if ex["gid"] in iptvorg_epg_map:
+        out.write(f"  <channel id={quoteattr(ex['gid'])}>\n    <display-name>{escape(ex['name'])}</display-name>\n")
+        if ex["logo"]:
+            out.write(f"    <icon src={quoteattr(ex['logo'])}/>\n")
+        out.write("  </channel>\n")
 
 for src, idmap in by_source.items():
     n0 = total_prog
@@ -363,8 +557,7 @@ for service, (epg_fname, idmap) in buddy_epg.items():
     if not idmap:
         continue
     n0 = total_prog
-    opener = gzip.open if epg_fname.endswith(".gz") else open
-    with opener(os.path.join(WORK, epg_fname), "rb") as f:
+    with epg_stream(os.path.join(WORK, epg_fname)) as f:
         for ev, el in ET.iterparse(f, events=("end",)):
             if el.tag == "programme":
                 sid = el.get("channel")
@@ -372,6 +565,22 @@ for service, (epg_fname, idmap) in buddy_epg.items():
                     write_programme(out, idmap[sid], el)
                 el.clear()
     print(f"buddy {service}: programmes kept {total_prog - n0}", flush=True)
+
+if iptvorg_epg_map:
+    by_file = {}
+    for gid, (gname, cid) in iptvorg_epg_map.items():
+        by_file.setdefault(gname, {})[cid] = gid
+    for gname, idmap in by_file.items():
+        n0 = total_prog
+        gopener = gzip.open if gname.endswith(".gz") else open
+        with gopener(os.path.join(WORK, gname), "rb") as f:
+            for ev, el in ET.iterparse(f, events=("end",)):
+                if el.tag == "programme":
+                    sid = el.get("channel")
+                    if sid in idmap and el.get("start", "")[:14] >= TODAY:
+                        write_programme(out, idmap[sid], el)
+                    el.clear()
+        print(f"iptv-org declared guide {gname}: programmes kept {total_prog - n0}", flush=True)
 out.write("</tv>\n")
 out.close()
 
@@ -400,6 +609,12 @@ for be in buddy_entries:
         line += f' tvg-logo="{be["logo"]}"'
     line += f' group-title="{be["category"]}",{be["name"]}'
     picked.append((PRIORITY.get(be["category"], 25), be["name"].lower(), line, be["url"]))
+for ex in extra_entries:
+    line = f'#EXTINF:-1 tvg-id="{ex["gid"]}"'
+    if ex["logo"]:
+        line += f' tvg-logo="{ex["logo"]}"'
+    line += f' group-title="{ex["category"]}",{ex["name"]}'
+    picked.append((PRIORITY.get(ex["category"], 25), ex["name"].lower(), line, ex["url"]))
 picked.sort(key=lambda t: (t[0], t[1]))
 with open(os.path.join(OUT_DIR, "us-playlist.m3u"), "w", encoding="utf-8") as f:
     f.write(f'#EXTM3U url-tvg="{GUIDE_URL}"\n')
@@ -408,16 +623,49 @@ with open(os.path.join(OUT_DIR, "us-playlist.m3u"), "w", encoding="utf-8") as f:
         f.write(url + "\n")
 print(f"playlist entries kept: {len(picked)}")
 
-total_channels = len(matches) + len(buddy_entries)
+# ---------- 6. VOD movie library (separate file) ----------
+# PublicDomainM3U: public-domain films/episodes hosted on Archive.org.
+# The live playlist's category rules do NOT apply here: the sources'
+# genre group-titles are kept as shelves, with posters and runtimes as
+# provided. No guide data exists for on-demand titles, so the file gets
+# its own bare header with no url-tvg.
+VOD_SOURCES = [
+    ("movies", "https://raw.githubusercontent.com/onlinem3u/publicdomainm3u/main/movies.m3u"),
+    ("series", "https://raw.githubusercontent.com/onlinem3u/publicdomainm3u/main/series.m3u"),
+]
+vod_pairs = []
+for vlabel, vurl in VOD_SOURCES:
+    vtext = fetch_text(vurl)
+    vpairs = parse_m3u(vtext) if vtext else []
+    vod_pairs.extend(vpairs)
+    print(f"vod {vlabel}: {len(vpairs)} titles", flush=True)
+vod_path = os.path.join(OUT_DIR, "vod-library.m3u")
+if vod_pairs:
+    with open(vod_path, "w", encoding="utf-8") as f:
+        f.write("#EXTM3U\n")
+        for line, url in vod_pairs:
+            f.write(line.rstrip() + "\n")
+            f.write(url + "\n")
+elif os.path.exists(vod_path):
+    os.unlink(vod_path)
+print(f"vod library: {len(vod_pairs)} titles, {'written' if vod_pairs else 'not written'}", flush=True)
+
+total_channels = len(matches) + len(buddy_entries) + len(extra_entries)
+vod_html = (f'<p>VOD movie library (public-domain films, grouped by genre): '
+            f'<a href="vod-library.m3u">vod-library.m3u</a> ({len(vod_pairs)} titles)</p>\n'
+            if vod_pairs else "")
 with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
     f.write(f"""<!doctype html><title>US IPTV playlist and guide for Brock</title>
 <h1>US IPTV playlist + custom guide</h1>
 <p>Playlist (US channels with guide data): <a href="us-playlist.m3u">us-playlist.m3u</a></p>
 <p>Guide file: <a href="guide.xml.gz">guide.xml.gz</a></p>
-<p>{total_channels} channels, {len(picked)} streams, {total_prog} programmes, {min_start[:8]} to {max_stop[:8]}.
+{vod_html}<p>{total_channels} channels, {len(picked)} streams, {total_prog} programmes, {min_start[:8]} to {max_stop[:8]}.
 Rebuilt daily by GitHub Actions from the iptv-org US playlist, the BuddyChewChew service
-playlists (Pluto, Samsung TV Plus, Plex, Roku, Xumo, Tubi) and free EPG sources.</p>
+playlists (Pluto, Samsung TV Plus, Plex, Roku, Xumo, Tubi, LG Channels), the Free-TV USA
+list and free EPG sources. Channels from the iptv-org remainder and other playlist-only
+sources are included without guide data.</p>
 <p>In Opus or UHF, add the us-playlist.m3u URL above as the playlist. Its header already
-points at the guide, and the guide channel IDs match the playlist IDs.</p>
+points at the guide, and the guide channel IDs match the playlist IDs. Add vod-library.m3u
+as a second playlist for on-demand movies.</p>
 """)
-print(f"DONE channels={total_channels} streams={len(picked)} programmes={total_prog} range={min_start}..{max_stop} size={os.path.getsize(gz_path)}")
+print(f"DONE channels={total_channels} streams={len(picked)} programmes={total_prog} extras={len(extra_entries)} vod={len(vod_pairs)} range={min_start}..{max_stop} size={os.path.getsize(gz_path)}")
