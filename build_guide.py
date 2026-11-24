@@ -4,9 +4,12 @@
 Two reputable, self-updating source families, both free and legal:
 
 1. iptv-org's US playlist (https://iptv-org.github.io/iptv/countries/us.m3u),
-   guide-matched by name against epg.pw US, epgshare01 US and the
-   matthuisman i.mjh.nz guides (Pluto, Plex, Roku, Samsung TV Plus, PBS).
-   Pluto channels also match exactly by the code in their stream URL.
+   guide-matched by name against epg.pw US, epgshare01 US (plus its
+   PLEX1 and WHALETVPLUS1 rippers) and the matthuisman i.mjh.nz guides
+   (Pluto, Plex, Roku, Samsung TV Plus, PBS). Pluto channels also match
+   exactly by the code in their stream URL, and an iptv-org API
+   guides.json pass resolves i.mjh.nz site_ids against those same
+   guide files for channels the name matching missed.
 
 2. BuddyChewChew's app-m3u-generator service playlists (Pluto TV US,
    Samsung TV Plus US, Plex US, Roku, Xumo, Tubi). These are generated
@@ -45,6 +48,8 @@ SOURCES = {
     "epgpw_US.xml.gz":     "https://epg.pw/xmltv/epg_US.xml.gz",
     "pbs_all.xml.gz":      "https://github.com/matthuisman/i.mjh.nz/raw/master/PBS/all.xml.gz",
     "epgshare_US2.xml.gz": "https://epgshare01.online/epgshare01/epg_ripper_US2.xml.gz",
+    "epgshare_PLEX1.xml.gz": "https://epgshare01.online/epgshare01/epg_ripper_PLEX1.xml.gz",
+    "epgshare_WHALETVPLUS1.xml.gz": "https://epgshare01.online/epgshare01/epg_ripper_WHALETVPLUS1.xml.gz",
 }
 
 BUDDY = [
@@ -243,6 +248,81 @@ print("samsung:", name_match("samsung_all.xml.gz", lambda b, e: True, False, "na
 print("plex:", name_match("plex_all.xml.gz", lambda b, e: True, True, "name-plex"))
 print("roku:", name_match("roku_all.xml.gz", lambda b, e: True, True, "name-roku"))
 print("pbs:", name_match("pbs_all.xml.gz", lambda b, e: True, True, "name-pbs"))
+print("epgshare PLEX1:", name_match("epgshare_PLEX1.xml.gz", us_only, True, "name-plex1"))
+print("epgshare WHALETVPLUS1:", name_match("epgshare_WHALETVPLUS1.xml.gz", us_only, True, "name-whale"))
+
+# iptv-org API guides.json: maps iptv-org channel ids to the site that
+# publishes a guide for them. Its "sources" field is empty in the
+# published file and it carries no guide URLs, and the epg project's old
+# per-site GitHub Pages files are gone (404), so the file cannot be
+# used as a download index. But for site "i.mjh.nz" the site_id encodes
+# exactly which already-downloaded guide file holds the channel:
+# "Plex/us#<provider>-<channel>", "Roku/all#<id>", and so on. The
+# provider segment of the i.mjh.nz Plex/Samsung ids rotates between
+# publishes while the channel segment is stable, so resolve by exact
+# id first, then by a unique channel-segment match, and only claim a
+# channel that actually has programmes from today forward in that file.
+GUIDES_JSON_URL = "https://iptv-org.github.io/api/guides.json"
+MJH_FILE = {"PlutoTV": "pluto_all.xml.gz", "Plex": "plex_all.xml.gz",
+            "Roku": "roku_all.xml.gz", "SamsungTVPlus": "samsung_all.xml.gz",
+            "PBS": "pbs_all.xml.gz"}
+_prog_cache = {}
+def prog_channels(fname):
+    """(exact ids, segment -> [ids]) for channels with programmes today+."""
+    if fname in _prog_cache:
+        return _prog_cache[fname]
+    exact, seg = set(), defaultdict(set)
+    with gzip.open(os.path.join(WORK, fname), "rb") as f:
+        for ev, el in ET.iterparse(f, events=("end",)):
+            if el.tag == "programme":
+                cid = el.get("channel")
+                if cid and el.get("start", "")[:14] >= TODAY:
+                    exact.add(cid)
+                    seg[cid.rsplit("-", 1)[-1]].add(cid)
+                el.clear()
+    _prog_cache[fname] = (exact, seg)
+    return _prog_cache[fname]
+
+try:
+    fetch(GUIDES_JSON_URL, os.path.join(WORK, "guides.json"))
+    if os.path.getsize(os.path.join(WORK, "guides.json")) > 80_000_000:
+        raise ValueError("guides.json unexpectedly large")
+    import json
+    with open(os.path.join(WORK, "guides.json"), encoding="utf-8") as f:
+        gj = json.load(f)
+    cand = {}   # base -> (region rank, service, idpart, site_name)
+    for e in gj:
+        base = e.get("channel")
+        if not base or base not in base_info or base in matches:
+            continue
+        if e.get("site") != "i.mjh.nz":
+            continue
+        m = re.match(r"^([^/]+)/([^#]+)#(.+)$", e.get("site_id") or "")
+        if not m or m.group(1) not in MJH_FILE:
+            continue
+        region = m.group(2)
+        rank = 0 if region == "us" else (1 if region == "all" else 2)
+        cur = cand.get(base)
+        if cur is None or rank < cur[0]:
+            cand[base] = (rank, m.group(1), m.group(3), e.get("site_name") or base)
+    n_gj = 0
+    for base, (rank, service, idpart, sname) in cand.items():
+        fname = MJH_FILE[service]
+        exact, seg = prog_channels(fname)
+        resolved = None
+        if idpart in exact:
+            resolved = idpart
+        else:
+            ids = seg.get(idpart.rsplit("-", 1)[-1], set())
+            if len(ids) == 1:
+                resolved = next(iter(ids))
+        if resolved:
+            before = len(matches)
+            claim(base, fname, resolved, "guidesjson-mjh", sname)
+            n_gj += len(matches) - before
+    print(f"guides.json i.mjh.nz: claimed {n_gj} channels from {len(cand)} candidates", flush=True)
+except Exception as e:
+    print(f"guides.json pass skipped ({e})", flush=True)
 print(f"iptv-org covered: {len(matches)} / {len(base_info)}")
 
 # ---------- 3. BuddyChewChew service playlists (IDs match their EPG) ----------
@@ -663,7 +743,8 @@ with open(os.path.join(OUT_DIR, "index.html"), "w", encoding="utf-8") as f:
 Rebuilt daily by GitHub Actions from the iptv-org US playlist, the BuddyChewChew service
 playlists (Pluto, Samsung TV Plus, Plex, Roku, Xumo, Tubi, LG Channels), the Free-TV USA
 list and free EPG sources. Channels from the iptv-org remainder and other playlist-only
-sources are included without guide data.</p>
+sources are included without guide data; guide coverage for them grows
+whenever a name or API match against the EPG sources succeeds.</p>
 <p>In Opus or UHF, add the us-playlist.m3u URL above as the playlist. Its header already
 points at the guide, and the guide channel IDs match the playlist IDs. Add vod-library.m3u
 as a second playlist for on-demand movies.</p>
